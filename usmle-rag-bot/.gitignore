@@ -1,0 +1,6 @@
+.env
+data/
+__pycache__/
+*.pyc
+first_aid_split_preview/
+*.pdf

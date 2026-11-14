@@ -1,0 +1,9 @@
+# Local PDF splitting + embedding/ingestion (not needed on the server)
+pymupdf4llm>=0.0.17
+langchain-text-splitters>=0.3
+pymongo>=4.8
+numpy>=1.26
+google-genai>=1.0
+gemini-api-rotator>=2.0.0
+pydantic>=2.6
+python-dotenv>=1.0

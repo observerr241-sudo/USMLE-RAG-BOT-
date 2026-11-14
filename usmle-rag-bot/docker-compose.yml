@@ -1,0 +1,44 @@
+services:
+  # ---- the 24/7 Telegram bot ------------------------------------------------
+  bot:
+    build: .
+    container_name: usmle-rag-bot
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - rotator_data:/app/data     # rotator SQLite (suspended keys + latency stats) survives restarts
+    # Webhook mode only: set WEBHOOK_BASE_URL in .env and uncomment
+    # ports:
+    #   - "8080:8080"
+
+  # ---- one-shot book ingestion (run on demand, not started by `up`) ---------
+  #   1. put the First Aid PDF in ./book/
+  #   2. docker compose run --rm -e SPLIT_ONLY=1 ingest     # split only, inspect ./first_aid_split_preview/
+  #   3. docker compose run --rm ingest                      # split + embed + load MongoDB
+  ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingest
+    profiles: ["ingest"]
+    env_file: .env
+    environment:
+      PDF_OFFSET: ${PDF_OFFSET:-}
+      SPLIT_ONLY: ${SPLIT_ONLY:-0}
+      SKIP_SPLIT: ${SKIP_SPLIT:-0}
+      INGEST_RESET: ${INGEST_RESET:-0}
+    volumes:
+      - ./book:/book:ro
+      - ./first_aid_split_preview:/out
+
+  # ---- optional local MongoDB (skip if you use Cosmos DB for MongoDB / Atlas) ----
+  #   docker compose --profile localdb up -d --build   and set MONGODB_URI=mongodb://mongo:27017
+  mongo:
+    image: mongo:7
+    profiles: ["localdb"]
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  rotator_data:
+  mongo_data:

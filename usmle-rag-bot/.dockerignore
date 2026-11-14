@@ -1,0 +1,7 @@
+.env
+.git
+data
+book
+first_aid_split_preview
+*.pdf
+__pycache__
