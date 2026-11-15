@@ -30,11 +30,11 @@ MONGODB_DB: str = os.getenv("MONGODB_DB", "usmle_rag_db").strip() or "usmle_rag_
 # Comma-separated Gemini keys (duplicates removed, order preserved)
 GEMINI_API_KEYS: list[str] = list(dict.fromkeys(_csv("GEMINI_API_KEYS")))
 
-GENERATION_MODEL: str = os.getenv("GENERATION_MODEL", "gemini-2.5-flash")
+GENERATION_MODEL: str = os.getenv("GENERATION_MODEL", "gemini-3.6-flash")
 EMBEDDING_MODEL: str = "gemini-embedding-001"
 EMBEDDING_DIM: int = 768
 
-# Gemini rotator tuning (free tier of gemini-2.5-flash is roughly 10 RPM per key)
+# Gemini rotator tuning (free tier of gemini-3.6-flash is roughly 10 RPM per key)
 ROTATOR_DB: str = os.getenv("ROTATOR_DB", "data/rotator.db")
 ROTATOR_RPM_PER_KEY: int = int(os.getenv("ROTATOR_RPM_PER_KEY", "10"))
 ROTATOR_MAX_CONCURRENT_PER_KEY: int = int(os.getenv("ROTATOR_MAX_CONCURRENT_PER_KEY", "2"))

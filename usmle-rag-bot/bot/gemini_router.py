@@ -1,15 +1,11 @@
-"""Gemini access layer built on gemini-api-rotator.
-
-* MCQ generation  -> rotator.execute() (rotation, RPM tracking, cooldowns, retries, stats)
-* Embeddings      -> same rotator through its manual key API (execute() only wraps generate_content)
-"""
+﻿"""Gemini access layer built on gemini-api-rotator."""
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
 import time
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Callable, Literal
 
 import numpy as np
 from google import genai
@@ -23,13 +19,12 @@ from bot.prompts import build_system_prompt, build_user_prompt
 logger = logging.getLogger(__name__)
 
 
-# --------------------------------------------------------------------------- schema
 class USMLEQuestionItem(BaseModel):
     question_description: str = Field(
         description="The full self-contained USMLE clinical vignette plus single-sentence lead-in question in English."
     )
     options: list[str] = Field(
-        description="Array of exactly 5 concise answer strings in English WITHOUT the letter prefix (e.g., ['Enterococcus faecalis', 'Escherichia coli', ...])."
+        description="Array of exactly 5 concise answer strings in English WITHOUT the letter prefix."
     )
     correct_answer_index: int = Field(description="0-based index of the correct answer (0 to 4).")
     correct_option: Literal["A", "B", "C", "D", "E"] = Field(
@@ -44,7 +39,6 @@ class USMLEQuizResponse(BaseModel):
     questions: list[USMLEQuestionItem]
 
 
-# --------------------------------------------------------------------------- rotator singleton
 _rotator: GeminiAPIRotator | None = None
 
 
@@ -60,16 +54,16 @@ def get_rotator() -> GeminiAPIRotator:
         from gemini_rotator.adapters import SQLiteAdapter
 
         os.makedirs(os.path.dirname(os.path.abspath(config.ROTATOR_DB)), exist_ok=True)
-        db = SQLiteAdapter(config.ROTATOR_DB)  # keeps suspended-key state + latency stats across restarts
-    except Exception as exc:  # persistence is optional
+        db = SQLiteAdapter(config.ROTATOR_DB)
+    except Exception as exc:
         logger.warning("Rotator SQLite persistence disabled: %s", exc)
 
     n = len(config.GEMINI_API_KEYS)
     cfg = RotatorConfig(
         rpm_per_key=config.ROTATOR_RPM_PER_KEY,
         max_concurrent_per_key=config.ROTATOR_MAX_CONCURRENT_PER_KEY,
-        max_retries=max(4, min(n * 2, 10)),
-        retry_delay_seconds=1.5,
+        max_retries=2,
+        retry_delay_seconds=1.0,
     )
     _rotator = GeminiAPIRotator(
         config.GEMINI_API_KEYS,
@@ -82,7 +76,6 @@ def get_rotator() -> GeminiAPIRotator:
 
 
 async def revalidate_loop(interval_seconds: int = 6 * 3600) -> None:
-    """Background task: probe suspended keys so they rejoin rotation when healthy again."""
     while True:
         await asyncio.sleep(interval_seconds)
         try:
@@ -92,9 +85,7 @@ async def revalidate_loop(interval_seconds: int = 6 * 3600) -> None:
             logger.exception("Rotator revalidation failed")
 
 
-# --------------------------------------------------------------------------- generic rotated call
 async def call_with_rotation(fn: Callable[[genai.Client], Any], *, model: str, max_attempts: int | None = None) -> Any:
-    """Run a blocking google-genai call with a rotator-selected key; rotate on 429/quota/suspension/5xx."""
     rotator = get_rotator()
     attempts = max_attempts or max(4, min(len(config.GEMINI_API_KEYS) * 2, 10))
     last_exc: Exception | None = None
@@ -122,7 +113,6 @@ async def call_with_rotation(fn: Callable[[genai.Client], Any], *, model: str, m
     raise last_exc
 
 
-# --------------------------------------------------------------------------- embeddings
 def _normalize(vecs: list[list[float]]) -> list[list[float]]:
     arr = np.asarray(vecs, dtype=np.float32)
     norms = np.linalg.norm(arr, axis=1, keepdims=True)
@@ -131,7 +121,6 @@ def _normalize(vecs: list[list[float]]) -> list[list[float]]:
 
 
 async def embed_texts(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
-    """Embed with gemini-embedding-001 @ 768 dims (L2-normalised, as required for truncated dims)."""
     if not texts:
         return []
 
@@ -153,9 +142,7 @@ async def embed_query(text: str) -> list[float]:
     return (await embed_texts([text], task_type="RETRIEVAL_QUERY"))[0]
 
 
-# --------------------------------------------------------------------------- MCQ generation
 def _clean_questions(items: list[USMLEQuestionItem]) -> list[dict]:
-    """Drop malformed items and make letter/index consistent."""
     good: list[dict] = []
     seen: set[str] = set()
     for it in items:
@@ -179,8 +166,19 @@ def _clean_questions(items: list[USMLEQuestionItem]) -> list[dict]:
     return good
 
 
+# Fast low-latency models first so Windows sockets never hang for 80+ seconds
+FALLBACK_MODELS = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+]
+
+
 async def generate_mcqs(topic: str, subtopic: str, count: int, chunks: str, segment_group: int) -> list[dict]:
-    """ONE structured-JSON Gemini call producing `count` MCQs. Raises RuntimeError if it cannot."""
     rotator = get_rotator()
     system = build_system_prompt(topic, subtopic, count)
     prompt = build_user_prompt(topic, subtopic, count, chunks)
@@ -188,47 +186,65 @@ async def generate_mcqs(topic: str, subtopic: str, count: int, chunks: str, segm
     best: list[dict] = []
     last_error = "unknown error"
 
-    for attempt in range(1, 4):
-        # Spread topic groups over different starting keys: start_idx = (segment_group - 1) % len(keys)
-        # (rotator picks round-robin from its last index, so point it one slot before the desired start)
-        try:
-            n = rotator.total_count()
-            with rotator._lock:  # noqa: SLF001 - no public setter for the round-robin cursor
-                rotator._last_index = ((segment_group - 1) % n) - 1  # noqa: SLF001
-        except Exception:
-            pass
+    models_to_try = list(dict.fromkeys([config.GENERATION_MODEL] + FALLBACK_MODELS))
 
+    try:
+        n = rotator.total_count()
+        with rotator._lock:
+            rotator._last_index = ((segment_group - 1) % n) - 1
+    except Exception:
+        pass
+
+    for attempt, current_model in enumerate(models_to_try, start=1):
+        key = rotator.get_next_working_key()
+        if key is None:
+            raise RuntimeError("All Gemini API keys are suspended")
+        rotator.acquire(key)
+        t0 = time.perf_counter()
         try:
+            def _call() -> Any:
+                # 25s HTTP timeout prevents Windows [WinError 10053] socket hang
+                client = genai.Client(api_key=key, http_options={"timeout": 25000})
+                return client.models.generate_content(
+                    model=current_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        temperature=0.4,
+                        max_output_tokens=8192,
+                        response_mime_type="application/json",
+                        response_schema=USMLEQuizResponse,
+                    ),
+                )
+
             response = await asyncio.wait_for(
-                rotator.execute(
-                    prompt,
-                    model=config.GENERATION_MODEL,
-                    max_tokens=32768,
-                    temperature=0.4,
-                    system=system,
-                    extra_config={
-                        "response_mime_type": "application/json",
-                        "response_schema": USMLEQuizResponse,
-                        "thinking_config": {"thinking_budget": 1024},
-                    },
-                ),
-                timeout=240,
+                asyncio.get_running_loop().run_in_executor(None, _call),
+                timeout=28,
             )
+            rotator.record_outcome(key, exc=None, latency=time.perf_counter() - t0, model=current_model)
             parsed = USMLEQuizResponse.model_validate_json(response.text)
             good = _clean_questions(parsed.questions)[:count]
             if len(good) > len(best):
                 best = good
             if len(good) >= count:
+                logger.info("Generated %d MCQs using %s in %.1fs", len(good), current_model, time.perf_counter() - t0)
                 return good
-            last_error = f"model returned {len(good)}/{count} valid questions"
+            last_error = f"{current_model} returned {len(good)}/{count} valid questions"
         except (ValidationError, ValueError) as exc:
-            last_error = f"invalid JSON from model: {str(exc)[:120]}"
+            last_error = f"invalid JSON from {current_model}: {str(exc)[:120]}"
         except asyncio.TimeoutError:
-            last_error = "Gemini timed out"
+            last_error = f"timeout on {current_model} (>28s) -> switching model"
+            logger.warning("Attempt %d (%s) timed out -> switching model immediately", attempt, current_model)
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
-            logger.warning("generate_mcqs attempt %d failed: %s", attempt, last_error)
-        logger.warning("generate_mcqs attempt %d/3 incomplete: %s", attempt, last_error)
+            err_str = str(exc)
+            if "503" not in err_str and "404" not in err_str and "10053" not in err_str and "timed out" not in err_str.lower():
+                rotator.record_outcome(key, exc=exc, model=current_model)
+            last_error = f"{type(exc).__name__} on {current_model}: {err_str[:120]}"
+            logger.warning("Attempt %d (%s) failed: %s -> switching model immediately", attempt, current_model, last_error)
+        finally:
+            rotator.release(key)
+
+        await asyncio.sleep(0.3)
 
     if len(best) >= min_ok:
         return best
